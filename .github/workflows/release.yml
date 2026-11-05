@@ -1,0 +1,159 @@
+# Copyright (c) 2025 VH & Co BV. Licensed under the Apache License 2.0. See LICENSE for details.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - '*.*.*'
+
+permissions: {}
+
+jobs:
+  build:
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Short-lived, read-only, scoped to the monorepo alone. Replaces the long-lived
+      # MONOREPO_READ_TOKEN PAT (D-APP: no long-lived credentials). The app is owned by
+      # the monorepo's account because an org-owned app cannot reach a personal repo.
+      - name: Mint monorepo read token
+        id: monorepo-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.MONOREPO_READER_APP_ID }}
+          private-key: ${{ secrets.MONOREPO_READER_PRIVATE_KEY }}
+          owner: michielvha
+          repositories: stackweaver
+
+      - name: Create .netrc for private Go modules
+        env:
+          MONOREPO_TOKEN: ${{ steps.monorepo-token.outputs.token }}
+        run: |
+          # %s with an argument, not interpolation into the format string: a token
+          # containing a % would otherwise be mangled by printf.
+          printf "machine github.com\nlogin x-access-token\npassword %s\n" "$MONOREPO_TOKEN" > .netrc
+          chmod 600 .netrc
+
+      - name: Build and push by digest
+        uses: michielvha/docker-release-action@c499e52a1a05e5bdd8cf03ba19a423d4c7ec25e3 # v2 (supply-chain)
+        with:
+          matrix-mode: build
+          version: ${{ github.ref_name }}
+          registry: ghcr.io
+          username: vhco-pro
+          password: ${{ secrets.GITHUB_TOKEN }}
+          project: stackweaver-launcher
+          platforms: ${{ matrix.platform }}
+          context: .
+          secret-files: netrc=.netrc
+
+  merge:
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create multi-arch manifest
+        uses: michielvha/docker-release-action@c499e52a1a05e5bdd8cf03ba19a423d4c7ec25e3 # v2 (supply-chain)
+        with:
+          matrix-mode: merge
+          version: ${{ github.ref_name }}
+          registry: ghcr.io
+          username: vhco-pro
+          password: ${{ secrets.GITHUB_TOKEN }}
+          project: stackweaver-launcher
+          trivy-exit-code: '0'
+          cosign-sign: 'true'
+          sbom: 'true'
+          attest-provenance: ${{ github.event.repository.visibility == 'public' }}
+          attest-sbom: ${{ github.event.repository.visibility == 'public' }}
+
+  changelog:
+    needs: merge
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Changelog & GitHub Release
+        uses: michielvha/changelog-release-action@81984f615bdcb8f88bbf92f49cae8d70f0fce099 # main snapshot 2026-05-23
+        with:
+          version: ${{ github.ref_name }}
+
+  # The launcher also runs without Docker, in-process on a Linux host (the raw-VM path), so each
+  # release attaches static binaries, their checksums and a build provenance attestation.
+  binaries:
+    needs: changelog
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Mint monorepo read token
+        id: monorepo-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.MONOREPO_READER_APP_ID }}
+          private-key: ${{ secrets.MONOREPO_READER_PRIVATE_KEY }}
+          owner: michielvha
+          repositories: stackweaver
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: backend/go.mod
+          cache: false
+
+      - name: Build static binaries
+        env:
+          MONOREPO_TOKEN: ${{ steps.monorepo-token.outputs.token }}
+          VERSION: ${{ github.ref_name }}
+          GOPRIVATE: github.com/michielvha/*
+          CGO_ENABLED: '0'
+        run: |
+          printf "machine github.com\nlogin x-access-token\npassword %s\n" "$MONOREPO_TOKEN" > "$HOME/.netrc"
+          chmod 600 "$HOME/.netrc"
+          mkdir -p dist
+          cd backend
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "../dist/stackweaver-launcher_${VERSION}_linux_${arch}" ./cmd/launcher
+          done
+          cd ../dist
+          sha256sum stackweaver-launcher_* > SHA256SUMS
+          rm -f "$HOME/.netrc"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/stackweaver-launcher_*
+
+      - name: Attach to the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: gh release upload "$VERSION" dist/stackweaver-launcher_* dist/SHA256SUMS --clobber
