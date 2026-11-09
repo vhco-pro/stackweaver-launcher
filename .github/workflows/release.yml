@@ -60,6 +60,8 @@ jobs:
           platforms: ${{ matrix.platform }}
           context: .
           secret-files: netrc=.netrc
+          build-args: |
+            VERSION=${{ github.ref_name }}
 
   merge:
     needs: build
